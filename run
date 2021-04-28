@@ -1,0 +1,138 @@
+#!/usr/bin/env sh
+
+set -e
+
+cd "$(dirname "$0")"
+
+MAKE=make
+NPROC=nproc
+SUDO=sudo
+TAGS=ctags
+if [ "$(uname -s)" = "OpenBSD" ]; then
+    NPROC="sysctl -n hw.ncpuonline"
+    SUDO="doas"
+    TAGS="ectags"
+    export MAKE=gmake
+    export CC="egcc"
+    export CXX="eg++"
+    export LDFLAGS=-Wl,-z,notext
+fi
+
+mode="${1}"
+no_ask="${2}"
+
+make_cross() {
+    if [ ! -d "./cross/" ]; then
+        if [ "$no_ask" != "-y" ]; then
+            echo -n "Do you want to compile a cross compiler (this can take around 20 minutes)? [yn] "
+            read -r answer
+            if ! [ "$answer" != "${answer#[Yy]}" ]; then
+                echo "The compilation of melvix requires a cross compiler!"
+                exit 1
+            fi
+        fi
+
+        # Create directory
+        mkdir -p cross
+        cd cross
+        DIR=$(pwd)
+
+        # Get sources
+        mkdir "${DIR}/src" && cd "${DIR}/src"
+        echo "Downloading..."
+        curl "https://ftp.gnu.org/gnu/binutils/binutils-2.33.1.tar.gz" >binutils.tar.gz
+        tar xzf binutils.tar.gz
+        curl "https://ftp.gnu.org/gnu/gcc/gcc-9.2.0/gcc-9.2.0.tar.gz" >gcc.tar.gz
+        tar xzf gcc.tar.gz
+
+        # Prepare compiling
+        mkdir -p "${DIR}/opt/bin"
+        export PREFIX="${DIR}/opt"
+        export TARGET=i686-elf
+        export PATH="$PREFIX/bin:$PATH"
+
+        if [ "$(uname -s)" = "OpenBSD" ]; then
+            export with_gmp=/usr/local
+            sed -i 's/-no-pie/-nopie/g' "${DIR}/src/gcc-9.2.0/gcc/configure"
+        fi
+
+        # Compile binutils
+        mkdir "${DIR}/src/build-binutils" && cd "${DIR}/src/build-binutils"
+        ../binutils-2.33.1/configure --target="$TARGET" --prefix="$PREFIX" --with-sysroot --disable-nls --disable-werror
+        $MAKE -j $($NPROC)
+        $MAKE install
+
+        # Compile GCC
+        mkdir "${DIR}/src/build-gcc" && cd "${DIR}/src/build-gcc"
+        ../gcc-9.2.0/configure --target="$TARGET" --prefix="$PREFIX" --disable-nls --enable-languages=c --without-headers
+        $MAKE -j $($NPROC) all-gcc all-target-libgcc
+        $MAKE install-gcc install-target-libgcc
+
+        # Fix things
+        if [ "$(uname -s)" = "OpenBSD" ]; then
+            cd "${DIR}/opt/libexec/gcc/i686-elf/9.2.0/" && ln -sf liblto_plugin.so.0.0 liblto_plugin.so
+        fi
+
+        cd "${DIR}/.."
+    fi
+}
+
+make_build() {
+    mkdir -p build/
+
+    # Build
+    printf "\nBuilding...\n"
+    $MAKE -j $($NPROC)
+
+    # Create disk image
+    dd if=/dev/zero of=build/disk.img bs=1k count=32k status=none
+    if [ "$(uname -s)" = "OpenBSD" ]; then
+        VND=$($SUDO vnconfig build/disk.img)
+        (
+            echo "e 0"
+            echo 83
+            echo n
+            echo 0
+            echo "*"
+            echo "quit"
+        ) | $SUDO fdisk -e $VND >/dev/null
+        $SUDO mkfs.ext2 -F /dev/${VND}i >/dev/null
+        $SUDO dd if=build/boot.bin of=/dev/${VND}i conv=notrunc status=none
+    else
+        $SUDO mke2fs -b 1024 -q build/disk.img
+        dd if=build/boot.bin of=build/disk.img conv=notrunc status=none
+    fi
+
+    # Mount disk and copy files
+    mkdir -p mnt/
+    if [ "$(uname -s)" = "OpenBSD" ]; then
+        $SUDO mount -t ext2fs /dev/${VND}i mnt/
+    else
+        $SUDO mount build/disk.img mnt/
+    fi
+    $SUDO cp -r build/load.bin mnt/load
+    $SUDO cp -r build/example mnt/kernel
+    $SUDO umount mnt/
+    rm -rf mnt/
+
+    if [ "$(uname -s)" = "OpenBSD" ]; then
+        $SUDO vnconfig -u $VND
+    fi
+}
+
+make_example() {
+    qemu-system-i386 -d guest_errors -cpu max -serial stdio -m 256M -vga std -drive file=build/disk.img,format=raw,index=1,media=disk
+}
+
+if [ "${mode}" = "cross" ]; then
+    make_cross
+elif [ "${mode}" = "build" ]; then
+    make_cross
+    $MAKE clean
+    make_build
+elif [ "${mode}" = "example" ]; then
+    make_cross
+    $MAKE clean
+    make_build
+    make_example
+fi
